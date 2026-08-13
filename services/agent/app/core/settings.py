@@ -1,8 +1,8 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -34,8 +34,12 @@ class Settings(BaseSettings):
     knowledge_backend: Literal["chroma", "memory"] = "chroma"
     max_input_chars: int = Field(default=8_000, ge=100, le=100_000)
     max_reflection_loops: int = Field(default=1, ge=0, le=3)
-    require_approval_for: tuple[str, ...] = ("refund", "account_credit", "cancel_order")
-    allowed_origins: tuple[str, ...] = ("http://localhost:3000",)
+    require_approval_for: Annotated[tuple[str, ...], NoDecode] = (
+        "refund",
+        "account_credit",
+        "cancel_order",
+    )
+    allowed_origins: Annotated[tuple[str, ...], NoDecode] = ("http://localhost:3000",)
 
     @field_validator("require_approval_for", "allowed_origins", mode="before")
     @classmethod
