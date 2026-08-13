@@ -17,7 +17,7 @@ test-unit:
 
 test-e2e:
 	docker compose -f compose.yaml -f compose.e2e.yaml up --build -d --wait
-	RUN_E2E=1 uv run pytest -m e2e tests/e2e
+	RUN_E2E=1 uv run --env-file .env pytest -m e2e tests/e2e
 
 run:
 	docker compose up --build
