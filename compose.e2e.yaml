@@ -1,0 +1,8 @@
+services:
+  agent:
+    environment:
+      MODEL_PROVIDER: fake
+      MODEL_NAME: fake
+      KNOWLEDGE_BACKEND: memory
+      LANGSMITH_TRACING: "false"
+

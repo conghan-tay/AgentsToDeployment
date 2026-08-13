@@ -1,0 +1,113 @@
+name: support-agent-template
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      API_KEY: ${API_KEY:-local-api-key}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-local-internal-key}
+      AGENT_SERVICE_URL: http://agent:8000
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      agent:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: services/agent/Dockerfile
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-local-internal-key}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-openai}
+      MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-support-agent-template}
+      POSTGRES_DSN: postgresql://support:support@postgres:5432/support?sslmode=disable
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      CHROMA_SSL: "false"
+      MCP_SERVER_URL: http://mcp-tools:8001/mcp
+      CHECKPOINTER_BACKEND: postgres
+      KNOWLEDGE_BACKEND: ${KNOWLEDGE_BACKEND:-chroma}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+      mcp-tools:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  mcp-tools:
+    build:
+      context: .
+      dockerfile: services/mcp-tools/Dockerfile
+    environment:
+      MCP_PORT: "8001"
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support
+    volumes:
+      # PostgreSQL 18 stores versioned clusters below this parent directory.
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  chroma:
+    image: chromadb/chroma:1.5.9
+    volumes:
+      - chroma_data:/data
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /data
+      ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  chroma_data:
+  redis_data:
