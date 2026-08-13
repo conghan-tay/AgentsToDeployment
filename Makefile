@@ -26,4 +26,4 @@ seed:
 	uv run python scripts/seed_knowledge.py
 
 down:
-	docker compose down
+	docker compose down -v

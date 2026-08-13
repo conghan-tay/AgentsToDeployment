@@ -77,6 +77,9 @@ func (h *Handler) upsertKnowledge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxyJSON(w http.ResponseWriter, r *http.Request, upstreamPath string) {
+	started := time.Now()
+	requestID := requestIDFrom(r.Context())
+
 	if r.Method != http.MethodGet && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 		return
@@ -98,6 +101,15 @@ func (h *Handler) proxyJSON(w http.ResponseWriter, r *http.Request, upstreamPath
 		writeError(w, http.StatusBadGateway, "agent service unavailable")
 		return
 	}
+	h.logger.Info(
+		"gateway request completed",
+		"request_id", requestID,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"upstream_path", upstreamPath,
+		"status", response.StatusCode,
+		"duration_ms", time.Since(started).Milliseconds(),
+	)
 	writeJSON(w, response.StatusCode, response.Body)
 }
 

@@ -5,6 +5,10 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from langgraph.types import Command
 
+import time
+import structlog
+logger = structlog.get_logger(__name__)
+
 from ..core.schemas import (
     ApprovalDecision,
     HealthResponse,
@@ -71,6 +75,8 @@ async def health() -> HealthResponse:
     dependencies=[Depends(require_internal_key)],
 )
 async def create_run(payload: TicketRequest, request: Request) -> RunResponse:
+    started = time.perf_counter()
+    request_id = request.headers.get("X-Request-ID", "unknown")
     ticket_id = str(uuid4())
     result = await request.app.state.graph.ainvoke(
         {
@@ -82,7 +88,17 @@ async def create_run(payload: TicketRequest, request: Request) -> RunResponse:
         },
         _config(ticket_id),
     )
-    return _response(ticket_id, result)
+    response = _response(ticket_id, result)
+    logger.info(
+            "support_run_completed",
+            request_id=request_id,
+            ticket_id=ticket_id,
+            status=response.status,
+            category=response.category,
+            duration_ms=round((time.perf_counter() - started) * 1000),
+        )
+    
+    return response
 
 
 @router.get(
