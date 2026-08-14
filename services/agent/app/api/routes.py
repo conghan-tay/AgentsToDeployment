@@ -1,13 +1,11 @@
 import re
+import time
 from typing import Any
 from uuid import uuid4
 
+import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from langgraph.types import Command
-
-import time
-import structlog
-logger = structlog.get_logger(__name__)
 
 from ..core.schemas import (
     ApprovalDecision,
@@ -20,6 +18,8 @@ from ..core.schemas import (
     TicketRequest,
 )
 from ..core.settings import Settings, get_settings
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -90,14 +90,14 @@ async def create_run(payload: TicketRequest, request: Request) -> RunResponse:
     )
     response = _response(ticket_id, result)
     logger.info(
-            "support_run_completed",
-            request_id=request_id,
-            ticket_id=ticket_id,
-            status=response.status,
-            category=response.category,
-            duration_ms=round((time.perf_counter() - started) * 1000),
-        )
-    
+        "support_run_completed",
+        request_id=request_id,
+        ticket_id=ticket_id,
+        status=response.status,
+        category=response.category,
+        duration_ms=round((time.perf_counter() - started) * 1000),
+    )
+
     return response
 
 
