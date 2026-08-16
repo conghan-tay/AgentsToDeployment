@@ -9,7 +9,9 @@ from ..core.settings import Settings
 from ..knowledge.repository import KnowledgeRepository
 from ..tools.registry import ToolRegistry
 from .state import SupportState
+import structlog
 
+logger = structlog.get_logger(__name__)
 
 def build_graph(
     *,
@@ -27,6 +29,9 @@ def build_graph(
 
     async def sanitize(state: SupportState) -> dict[str, Any]:
         result = inspect_user_text(state["message"], settings.max_input_chars)
+        logger.info(
+                "sanitize running"
+        )
         return {
             "sanitized_message": result.sanitized_text,
             "safety_flags": list(result.flags),
@@ -34,19 +39,23 @@ def build_graph(
         }
 
     async def classify(state: SupportState) -> dict[str, Any]:
+        logger.info("classify running")
         result = await model.classify(state["sanitized_message"])
         return {"classification": result.model_dump(mode="json")}
 
     async def retrieve(state: SupportState) -> dict[str, Any]:
+        logger.info("retrieve running")
         documents = await knowledge.search(state["sanitized_message"], limit=4)
         return {"documents": documents}
 
     async def plan(state: SupportState) -> dict[str, Any]:
+        logger.info("plan running")
         classification = Classification.model_validate(state["classification"])
         decision = await model.plan(state["sanitized_message"], classification)
         return {"plan": decision.model_dump(mode="json")}
 
     async def execute_read_tools(state: SupportState) -> dict[str, Any]:
+        logger.info("execute_read_tools running")
         decision = Plan.model_validate(state["plan"])
         if decision.action != "lookup_order":
             return {"tool_results": []}
@@ -61,6 +70,7 @@ def build_graph(
         return {"tool_results": [{"name": result.name, "output": result.output}]}
 
     async def draft(state: SupportState) -> dict[str, Any]:
+        logger.info("draft running")
         context = safe_context(state.get("documents", []))
         previous_feedback = state.get("critique")
         critique_text = (
@@ -87,6 +97,7 @@ def build_graph(
         return {"draft": await model.draft(prompt)}
 
     async def reflect(state: SupportState) -> dict[str, Any]:
+        logger.info("reflect running")
         context = safe_context(state.get("documents", []))
         critique = await model.critique(state["draft"], context)
         return {
@@ -95,6 +106,7 @@ def build_graph(
         }
 
     def after_reflection(state: SupportState) -> Literal["draft", "approval"]:
+        logger.info("after_reflection running")
         if (
             not Critique.model_validate(state["critique"]).passed
             and state["reflection_count"] <= settings.max_reflection_loops
@@ -103,6 +115,7 @@ def build_graph(
         return "approval"
 
     async def approval(state: SupportState) -> dict[str, Any]:
+        logger.info("approval running")
         decision = Plan.model_validate(state["plan"])
         if decision.action not in settings.require_approval_for:
             return {"status": "completed", "final_answer": state["draft"]}

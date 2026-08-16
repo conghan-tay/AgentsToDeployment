@@ -136,6 +136,16 @@ curl -sS http://localhost:8080/v1/tickets/TICKET_ID/decision \
 Stop the stack with `make down`. Add `-v` to `docker compose down` only when you
 intentionally want to delete local PostgreSQL, Chroma, and Redis data.
 
+## Logging
+
+```bash
+docker compose logs -f gateway agent
+```
+
+```bash
+docker compose logs -f agent
+```
+
 ## API
 
 | Method | Route | Purpose |
