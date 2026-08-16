@@ -4,6 +4,9 @@ The application is container-first. The Go gateway, Python agent, and MCP tool s
 are stateless and can run on Kubernetes, Cloud Run/ECS-style container platforms, or a
 developer PaaS. Durable state lives in managed services.
 
+For a worked end-to-end example on a single managed PaaS, see
+[`railway.md`](railway.md), which deploys the whole stack from a forked repository.
+
 ## Recommended managed layout
 
 | Concern | Google Cloud | AWS |
