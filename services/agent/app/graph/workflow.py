@@ -1,5 +1,6 @@
 from typing import Any, Literal
 
+import structlog
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -9,9 +10,9 @@ from ..core.settings import Settings
 from ..knowledge.repository import KnowledgeRepository
 from ..tools.registry import ToolRegistry
 from .state import SupportState
-import structlog
 
 logger = structlog.get_logger(__name__)
+
 
 def build_graph(
     *,
@@ -29,9 +30,7 @@ def build_graph(
 
     async def sanitize(state: SupportState) -> dict[str, Any]:
         result = inspect_user_text(state["message"], settings.max_input_chars)
-        logger.info(
-                "sanitize running"
-        )
+        logger.info("sanitize running")
         return {
             "sanitized_message": result.sanitized_text,
             "safety_flags": list(result.flags),

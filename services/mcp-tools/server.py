@@ -1,7 +1,10 @@
 import os
 from typing import Any
 
+import structlog
 from mcp.server.fastmcp import FastMCP
+
+logger = structlog.get_logger(__name__)
 
 mcp = FastMCP(
     "support-business-tools",
@@ -22,12 +25,21 @@ def lookup_order(order_id: str) -> dict[str, Any]:
         {"status": "in_transit", "eta_business_days": 3},
         {"status": "delivered", "eta_business_days": 0},
     )
-    return {"order_id": order_id, **states[suffix]}
+    state = states[suffix]
+    logger.info(
+        "lookup_order",
+        component="mcp_tool",
+        status=state["status"],
+        eta_business_days=state["eta_business_days"],
+    )
+    return {"order_id": order_id, **state}
 
 
 @mcp.tool()
 def get_shipping_region(postal_code: str) -> dict[str, str]:
     """Return a coarse demo shipping region for a postal code."""
+
+    logger.info("get_shipping_region", postal_code=postal_code)
 
     return {"postal_code": postal_code, "region": "standard"}
 
