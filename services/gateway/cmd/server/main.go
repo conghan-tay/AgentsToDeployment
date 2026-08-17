@@ -24,6 +24,7 @@ func main() {
 		cfg.AgentServiceURL,
 		cfg.InternalAPIKey,
 		&http.Client{Timeout: cfg.RequestTimeout},
+		&http.Client{Timeout: cfg.StreamTimeout},
 	)
 	if err != nil {
 		logger.Error("invalid agent client configuration", "error", err)
@@ -38,8 +39,10 @@ func main() {
 	defer redisClient.Close()
 	limiter := httpapi.NewRedisRateLimiter(redisClient, cfg.RateLimit, time.Minute)
 	server := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           httpapi.New(cfg.APIKey, upstream, limiter, logger, cfg.RequestTimeout),
+		Addr: ":" + cfg.Port,
+		Handler: httpapi.New(
+			cfg.APIKey, upstream, limiter, logger, cfg.RequestTimeout, cfg.StreamTimeout,
+		),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      cfg.RequestTimeout + 5*time.Second,

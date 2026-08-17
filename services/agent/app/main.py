@@ -9,6 +9,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from .api.routes import router
 from .core.logging import configure_logging
 from .core.models import build_model
+from .core.runs import BackgroundRuns
 from .core.settings import get_settings
 from .graph.workflow import build_graph
 from .knowledge.repository import build_knowledge_repository
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     stack = AsyncExitStack()
+    runs = BackgroundRuns()
     try:
         if settings.checkpointer_backend == "memory":
             checkpointer = InMemorySaver()
@@ -33,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         knowledge = build_knowledge_repository(settings)
         tools = await ToolRegistry.create(settings)
         app.state.knowledge = knowledge
+        app.state.runs = runs
         app.state.graph = build_graph(
             settings=settings,
             model=build_model(settings),
@@ -42,6 +45,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         yield
     finally:
+        # Cancel background runs before the checkpointer connection closes under them.
+        await runs.aclose()
         await stack.aclose()
 
 

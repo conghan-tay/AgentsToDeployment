@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     knowledge_backend: Literal["chroma", "memory"] = "chroma"
     max_input_chars: int = Field(default=8_000, ge=100, le=100_000)
     max_reflection_loops: int = Field(default=1, ge=0, le=3)
+    # Streaming reads run state from the checkpointer instead of holding the graph call
+    # open, so a stream costs one state query per poll and is capped in duration.
+    stream_poll_seconds: float = Field(default=1.0, ge=0.1, le=10.0)
+    stream_timeout_seconds: int = Field(default=300, ge=5, le=3_600)
     require_approval_for: Annotated[tuple[str, ...], NoDecode] = (
         "refund",
         "account_credit",
