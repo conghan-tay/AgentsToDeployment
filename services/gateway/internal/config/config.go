@@ -17,6 +17,9 @@ type Config struct {
 	RedisURL        string
 	RateLimit       int
 	RequestTimeout  time.Duration
+	// StreamTimeout bounds a server-sent-event connection. The agent caps its own stream
+	// first (STREAM_TIMEOUT_SECONDS, 300s by default); this is the edge backstop.
+	StreamTimeout time.Duration
 }
 
 func FromEnvironment() (Config, error) {
@@ -29,6 +32,7 @@ func FromEnvironment() (Config, error) {
 		RedisURL:        envOr("REDIS_URL", "redis://localhost:6379/0"),
 		RateLimit:       60,
 		RequestTimeout:  90 * time.Second,
+		StreamTimeout:   330 * time.Second,
 	}
 	if cfg.APIKey == "" || cfg.InternalAPIKey == "" {
 		return Config{}, fmt.Errorf("API_KEY and INTERNAL_API_KEY must not be empty")

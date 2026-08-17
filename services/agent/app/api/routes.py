@@ -1,12 +1,17 @@
+import asyncio
+import json
 import re
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
+from ..core.runs import BackgroundRuns
 from ..core.schemas import (
     ApprovalDecision,
     HealthResponse,
@@ -33,6 +38,20 @@ def require_internal_key(
 
 def _config(ticket_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": ticket_id}}
+
+
+def _graph_input(ticket_id: str, payload: TicketRequest) -> dict[str, Any]:
+    return {
+        "ticket_id": ticket_id,
+        "customer_id": payload.customer_id,
+        "message": payload.message,
+        "order_id": payload.order_id,
+        "metadata": payload.metadata,
+    }
+
+
+def _sse(event: str, data: str) -> str:
+    return f"event: {event}\ndata: {data}\n\n"
 
 
 def _pending_from_result(result: dict[str, Any]) -> PendingAction | None:
@@ -79,14 +98,7 @@ async def create_run(payload: TicketRequest, request: Request) -> RunResponse:
     request_id = request.headers.get("X-Request-ID", "unknown")
     ticket_id = str(uuid4())
     result = await request.app.state.graph.ainvoke(
-        {
-            "ticket_id": ticket_id,
-            "customer_id": payload.customer_id,
-            "message": payload.message,
-            "order_id": payload.order_id,
-            "metadata": payload.metadata,
-        },
-        _config(ticket_id),
+        _graph_input(ticket_id, payload), _config(ticket_id)
     )
     response = _response(ticket_id, result)
     logger.info(
@@ -99,6 +111,30 @@ async def create_run(payload: TicketRequest, request: Request) -> RunResponse:
     )
 
     return response
+
+
+@router.post(
+    "/internal/v1/runs/async",
+    response_model=RunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_key)],
+)
+async def create_run_async(payload: TicketRequest, request: Request) -> RunResponse:
+    """Accept a ticket and run the graph in the background.
+
+    The caller gets a ticket id immediately and follows the run on the streaming
+    endpoint, so request duration stops being tied to workflow duration.
+    """
+
+    request_id = request.headers.get("X-Request-ID", "unknown")
+    ticket_id = str(uuid4())
+    runs: BackgroundRuns = request.app.state.runs
+    runs.start(
+        ticket_id,
+        request.app.state.graph.ainvoke(_graph_input(ticket_id, payload), _config(ticket_id)),
+    )
+    logger.info("support_run_accepted", request_id=request_id, ticket_id=ticket_id)
+    return RunResponse(ticket_id=ticket_id, status=RunStatus.RUNNING)
 
 
 @router.get(
@@ -114,6 +150,61 @@ async def get_run(ticket_id: str, request: Request) -> RunResponse:
     if snapshot.interrupts:
         values["__interrupt__"] = snapshot.interrupts
     return _response(ticket_id, values)
+
+
+async def _run_events(request: Request, ticket_id: str, settings: Settings) -> AsyncIterator[str]:
+    """Emit one server-sent event per poll until the run ends or the stream is capped.
+
+    State comes from the checkpointer rather than from the graph call, so the stream can
+    be opened, dropped, and reopened without affecting the run itself.
+    """
+
+    graph = request.app.state.graph
+    runs: BackgroundRuns = request.app.state.runs
+    deadline = time.monotonic() + settings.stream_timeout_seconds
+    while True:
+        if await request.is_disconnected():
+            return
+        failure = runs.error(ticket_id)
+        if failure is not None:
+            yield _sse("error", json.dumps({"ticket_id": ticket_id, "error": failure}))
+            return
+        snapshot = await graph.aget_state(_config(ticket_id))
+        values = dict(snapshot.values)
+        if snapshot.interrupts:
+            values["__interrupt__"] = snapshot.interrupts
+            yield _sse("status", "waiting for approval...")
+        elif snapshot.next or "status" not in values:
+            # Nodes are still queued, or the run was just accepted: a new thread briefly
+            # holds its input with no scheduled task yet, which is not a finished run.
+            yield _sse("status", "running...")
+        else:
+            # Only a terminal node writes `status`, so this is a completed or rejected run.
+            yield _sse("result", _response(ticket_id, values).model_dump_json())
+            return
+        if time.monotonic() >= deadline:
+            yield _sse("timeout", "stream closed; reconnect to keep watching this ticket")
+            return
+        await asyncio.sleep(settings.stream_poll_seconds)
+
+
+@router.get(
+    "/internal/v1/runs/{ticket_id}/stream",
+    dependencies=[Depends(require_internal_key)],
+)
+async def get_run_streaming(
+    ticket_id: str, request: Request, settings: Settings = Depends(get_settings)
+) -> StreamingResponse:
+    snapshot = await request.app.state.graph.aget_state(_config(ticket_id))
+    # An unknown ticket must fail before the body starts; a just-accepted run is known to
+    # the registry even though it has not written its first checkpoint yet.
+    if not snapshot.values and not request.app.state.runs.is_active(ticket_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ticket not found")
+    return StreamingResponse(
+        _run_events(request, ticket_id, settings),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post(

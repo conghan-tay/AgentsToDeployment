@@ -6,9 +6,11 @@ from pydantic import BaseModel, Field
 
 
 class RunStatus(StrEnum):
+    RUNNING = "running"
     COMPLETED = "completed"
     WAITING_APPROVAL = "waiting_approval"
     REJECTED = "rejected"
+    FAILED = "failed"
 
 
 class TicketRequest(BaseModel):

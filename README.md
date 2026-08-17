@@ -123,6 +123,36 @@ curl -sS http://localhost:8080/v1/tickets \
   }'
 ```
 
+That call blocks until the workflow finishes. To keep the client responsive, accept the
+ticket immediately and follow the run over server-sent events instead:
+
+```bash
+TICKET=$(curl -sS http://localhost:8080/v1/tickets/async \
+  -H 'X-API-Key: local-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"customer-42","message":"Please refund order order-123","order_id":"order-123"}' \
+  | jq -r .ticket_id)
+
+curl -N http://localhost:8080/v1/tickets/$TICKET/stream -H 'X-API-Key: local-api-key'
+```
+
+The stream emits `running...` while nodes execute, `waiting for approval...` while the
+graph is parked on an `interrupt()`, and finally a `result` event carrying the same JSON
+the blocking endpoints return, then closes:
+
+```text
+event: status
+data: running...
+
+event: result
+data: {"ticket_id":"...","status":"completed","answer":"Your order is in transit ..."}
+```
+
+A stream is capped by `STREAM_TIMEOUT_SECONDS` (300 by default); after that it sends a
+`timeout` event and closes, and the client reconnects to the same ticket. Run state is
+read from the durable checkpointer on every poll, so dropping a stream never affects the
+run.
+
 A refund request returns `waiting_approval` and a `pending_action`. Resume the same
 durable graph thread with:
 
@@ -151,8 +181,10 @@ docker compose logs -f agent
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/healthz` | Gateway health |
-| `POST` | `/v1/tickets` | Start a durable support run |
+| `POST` | `/v1/tickets` | Start a durable support run and wait for it |
+| `POST` | `/v1/tickets/async` | Accept a run and return `202` with a `ticket_id` |
 | `GET` | `/v1/tickets/{ticket_id}` | Read current/completed run state |
+| `GET` | `/v1/tickets/{ticket_id}/stream` | Follow a run over server-sent events |
 | `POST` | `/v1/tickets/{ticket_id}/decision` | Approve or reject a pending action |
 | `POST` | `/v1/knowledge` | Upsert knowledge documents |
 
@@ -248,7 +280,12 @@ Production work that is intentionally left domain-specific:
 - Add tenant-aware JWT authorization and tenant-scoped knowledge filtering.
 - Add provider moderation and organization policy checks for your risk profile.
 - Add migrations/retention policy for application data beyond LangGraph checkpoints.
-- Add streaming only after the approval UX and error semantics are settled.
+- Make async runs multi-replica safe. `BackgroundRuns` (`core/runs.py`) tracks liveness and
+  failure in process memory, so `POST /v1/tickets/async` and its stream must reach the same
+  agent replica; move that bookkeeping to Redis or a runs table, and resume orphaned
+  checkpoints on boot, before scaling the agent out.
+- Add token-level streaming (`graph.astream`) if clients need partial drafts; the current
+  stream reports step-level status only.
 
 ## Why the services are split
 
