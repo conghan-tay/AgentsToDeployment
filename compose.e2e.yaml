@@ -1,8 +1,9 @@
 services:
-  agent:
+  worker:
     environment:
+      # Deterministic chat model, so the E2E run costs nothing and asserts exactly.
+      # Retrieval still uses real embeddings: the gateway writes the vectors the worker
+      # reads, and that cross-language contract is precisely what E2E exists to prove.
       MODEL_PROVIDER: fake
       MODEL_NAME: fake
-      KNOWLEDGE_BACKEND: memory
       LANGSMITH_TRACING: "false"
-

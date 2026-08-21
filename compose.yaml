@@ -8,26 +8,34 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       API_KEY: ${API_KEY:-local-api-key}
-      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-local-internal-key}
-      AGENT_SERVICE_URL: http://agent:8000
-      REDIS_URL: redis://redis:6379/0
       GATEWAY_PORT: "8080"
+      REDIS_URL: redis://redis:6379/0
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: support-agent
+      APPROVAL_TIMEOUT_HOURS: ${APPROVAL_TIMEOUT_HOURS:-72}
+      # The gateway owns knowledge ingestion, so it embeds and writes to Chroma itself.
+      CHROMA_URL: http://chroma:8000
+      CHROMA_COLLECTION: ${CHROMA_COLLECTION:-support_knowledge}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ports:
       - "8080:8080"
     depends_on:
-      agent:
+      temporal:
         condition: service_healthy
       redis:
         condition: service_healthy
+      chroma:
+        condition: service_started
     restart: unless-stopped
 
-  agent:
+  worker:
     build:
       context: .
       dockerfile: services/agent/Dockerfile
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
-      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-local-internal-key}
       MODEL_PROVIDER: ${MODEL_PROVIDER:-openai}
       MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -36,27 +44,65 @@ services:
       LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
       LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
       LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-support-agent-template}
-      POSTGRES_DSN: postgresql://support:support@postgres:5432/support?sslmode=disable
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: support-agent
       CHROMA_HOST: chroma
       CHROMA_PORT: "8000"
       CHROMA_SSL: "false"
+      CHROMA_COLLECTION: ${CHROMA_COLLECTION:-support_knowledge}
+      # Must match the gateway's EMBEDDING_MODEL: it writes the vectors this queries.
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
       MCP_SERVER_URL: http://mcp-tools:8001/mcp
-      CHECKPOINTER_BACKEND: postgres
-      KNOWLEDGE_BACKEND: ${KNOWLEDGE_BACKEND:-chroma}
     depends_on:
-      postgres:
+      temporal:
         condition: service_healthy
       chroma:
         condition: service_started
       mcp-tools:
         condition: service_started
-    ports:
-      - "8000:8000"
+    # No ports: the worker polls a Temporal task queue and serves no HTTP.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-m", "app.healthcheck"]
       interval: 10s
-      timeout: 3s
+      timeout: 10s
       retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  temporal:
+    # The dev server keeps the local stack to one container and persists to SQLite, so
+    # a paused approval survives `docker compose restart`. Production uses a real
+    # Temporal cluster or Temporal Cloud; see docs/deployment.md.
+    image: temporalio/temporal:1.8.2
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "7233"
+      - --ui-port
+      - "8233"
+      - --namespace
+      - default
+      - --db-filename
+      - /home/temporal/temporal.db
+    # Mounted at the image's existing home directory, which is owned by the temporal
+    # user, so the named volume inherits that ownership. A volume mounted at a path
+    # that does not exist in the image is created root-owned, and SQLite then fails
+    # with "unable to open database file".
+    volumes:
+      - temporal_data:/home/temporal
+    ports:
+      - "7233:7233"
+      # Temporal Web UI. 8233 rather than its default 8080 to leave that to the gateway.
+      - "8233:8233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   mcp-tools:
@@ -67,22 +113,6 @@ services:
       MCP_PORT: "8001"
     ports:
       - "8001:8001"
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:18-alpine
-    environment:
-      POSTGRES_USER: support
-      POSTGRES_PASSWORD: support
-      POSTGRES_DB: support
-    volumes:
-      # PostgreSQL 18 stores versioned clusters below this parent directory.
-      - postgres_data:/var/lib/postgresql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U support -d support"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
     restart: unless-stopped
 
   chroma:
@@ -108,6 +138,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  postgres_data:
+  temporal_data:
   chroma_data:
   redis_data:

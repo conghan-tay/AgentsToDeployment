@@ -9,39 +9,47 @@ class Settings(BaseSettings):
     """Runtime settings.
 
     Every external dependency is configured here, so a future project can replace
-    infrastructure without changing graph nodes or HTTP handlers.
+    infrastructure without changing graph nodes or the Temporal workflow.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
     environment: Literal["development", "test", "production"] = "development"
     log_level: str = "INFO"
-    internal_api_key: str = "local-internal-key"
 
     model_provider: Literal["openai", "anthropic", "google", "fake"] = "openai"
     model_name: str = "gpt-5-mini"
     model_temperature: float | None = None
 
-    postgres_dsn: str = "postgresql://support:support@localhost:5432/support?sslmode=disable"
-    redis_url: str = "redis://localhost:6379/0"
+    # Temporal owns durability, retries, and the approval pause. There is no
+    # application database: the workflow event history is the source of truth.
+    temporal_address: str = "localhost:7233"
+    temporal_namespace: str = "default"
+    temporal_task_queue: str = "support-agent"
+    temporal_api_key: str = ""
+    temporal_tls: bool = False
+
     chroma_host: str = "localhost"
     chroma_port: int = 8001
     chroma_ssl: bool = False
     chroma_collection: str = "support_knowledge"
+    # Must match EMBEDDING_MODEL on the gateway: the gateway writes the vectors this
+    # worker queries against, so a mismatch silently destroys retrieval quality.
+    embedding_model: str = "text-embedding-3-small"
     mcp_server_url: str | None = None
 
-    checkpointer_backend: Literal["postgres", "memory"] = "postgres"
-    knowledge_backend: Literal["chroma", "memory"] = "chroma"
     max_input_chars: int = Field(default=8_000, ge=100, le=100_000)
     max_reflection_loops: int = Field(default=1, ge=0, le=3)
+    # The approval deadline is not configured here: workflow code cannot read the
+    # environment, so the gateway passes it in as a workflow argument
+    # (APPROVAL_TIMEOUT_HOURS in services/gateway/internal/config).
     require_approval_for: Annotated[tuple[str, ...], NoDecode] = (
         "refund",
         "account_credit",
         "cancel_order",
     )
-    allowed_origins: Annotated[tuple[str, ...], NoDecode] = ("http://localhost:3000",)
 
-    @field_validator("require_approval_for", "allowed_origins", mode="before")
+    @field_validator("require_approval_for", mode="before")
     @classmethod
     def split_csv(cls, value: object) -> object:
         if isinstance(value, str):
@@ -50,8 +58,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def reject_demo_production_configuration(self) -> "Settings":
-        if self.environment == "production" and self.internal_api_key == "local-internal-key":
-            raise ValueError("INTERNAL_API_KEY must be replaced in production")
         if self.environment == "production" and self.model_provider == "fake":
             raise ValueError("the fake model is not allowed in production")
         return self

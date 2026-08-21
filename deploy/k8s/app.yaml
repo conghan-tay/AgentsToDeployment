@@ -12,13 +12,22 @@ data:
   ENVIRONMENT: production
   MODEL_PROVIDER: openai
   MODEL_NAME: gpt-5-mini
-  CHECKPOINTER_BACKEND: postgres
-  KNOWLEDGE_BACKEND: chroma
+  # A Temporal cluster or Temporal Cloud namespace is a prerequisite; it is not
+  # deployed by this manifest. See docs/deployment.md.
+  TEMPORAL_ADDRESS: replace-with-temporal-host:7233
+  TEMPORAL_NAMESPACE: replace-with-namespace
+  TEMPORAL_TASK_QUEUE: support-agent
+  TEMPORAL_TLS: "true"
+  APPROVAL_TIMEOUT_HOURS: "72"
+  # Ingestion (gateway) and retrieval (worker) address the same collection with the
+  # same embedding model. A mismatch silently destroys retrieval quality.
+  CHROMA_URL: https://replace-with-managed-chroma-host
   CHROMA_HOST: replace-with-managed-chroma-host
   CHROMA_PORT: "443"
   CHROMA_SSL: "true"
+  CHROMA_COLLECTION: support_knowledge
+  EMBEDDING_MODEL: text-embedding-3-small
   MCP_SERVER_URL: http://mcp-tools:8001/mcp
-  AGENT_SERVICE_URL: http://agent:8000
   REDIS_URL: redis://replace-with-managed-redis:6379/0
   LANGSMITH_TRACING: "true"
   LANGSMITH_PROJECT: support-agent-production
@@ -32,38 +41,42 @@ metadata:
 type: Opaque
 stringData:
   API_KEY: replace-me
-  INTERNAL_API_KEY: replace-me
+  # Required by the gateway to embed knowledge, regardless of the chat provider.
   OPENAI_API_KEY: replace-me
   LANGSMITH_API_KEY: replace-me
-  POSTGRES_DSN: postgresql://replace-with-managed-postgres/support?sslmode=require
+  TEMPORAL_API_KEY: replace-me
 ---
+# The worker exposes no port and needs no Service: it polls a Temporal task queue.
+# Scale it on task-queue backlog, not on HTTP concurrency.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: agent
+  name: worker
   namespace: support-agent
 spec:
   replicas: 2
   selector:
-    matchLabels: {app: agent}
+    matchLabels: {app: worker}
   template:
     metadata:
-      labels: {app: agent}
+      labels: {app: worker}
     spec:
       containers:
-        - name: agent
+        - name: worker
           image: ghcr.io/your-org/support-agent:latest
-          ports:
-            - containerPort: 8000
           envFrom:
             - configMapRef: {name: support-agent-config}
             - secretRef: {name: support-agent-secrets}
           readinessProbe:
-            httpGet: {path: /healthz, port: 8000}
-            initialDelaySeconds: 5
+            exec: {command: [python, -m, app.healthcheck]}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
           livenessProbe:
-            httpGet: {path: /healthz, port: 8000}
-            initialDelaySeconds: 20
+            exec: {command: [python, -m, app.healthcheck]}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "1", memory: 1Gi}
@@ -71,17 +84,6 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: agent
-  namespace: support-agent
-spec:
-  selector: {app: agent}
-  ports:
-    - port: 8000
-      targetPort: 8000
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -105,7 +107,7 @@ spec:
             - configMapRef: {name: support-agent-config}
             - secretRef: {name: support-agent-secrets}
           readinessProbe:
-            httpGet: {path: /healthz, port: 8080}
+            httpGet: {path: /readyz, port: 8080}
           livenessProbe:
             httpGet: {path: /healthz, port: 8080}
           resources:

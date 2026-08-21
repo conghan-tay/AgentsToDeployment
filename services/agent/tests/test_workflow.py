@@ -1,88 +1,134 @@
+import asyncio
+
 import pytest
-from app.core.models import FakeSupportModel
-from app.core.schemas import KnowledgeDocument
-from app.core.settings import Settings
-from app.graph.workflow import build_graph
-from app.knowledge.repository import MemoryKnowledgeRepository
-from app.tools.registry import ToolRegistry, lookup_order
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
+from app.core.schemas import ApprovalDecision, RunStatus, TicketRequest
+from app.temporal.workflows import SupportTicketWorkflow
+from temporalio.client import Client, WorkflowHandle
 
 
-async def make_graph():
-    settings = Settings(
-        model_provider="fake",
-        checkpointer_backend="memory",
-        knowledge_backend="memory",
-        mcp_server_url=None,
+async def _start(
+    client: Client,
+    task_queue: str,
+    ticket_id: str,
+    message: str,
+    approval_timeout_hours: int = 0,
+) -> WorkflowHandle:
+    """Start a ticket.
+
+    The deadline defaults to 0 (wait forever) so that the time-skipping server cannot
+    fast-forward past it while a test is still arranging its signal. Only the deadline
+    test opts into a real timeout.
+    """
+
+    return await client.start_workflow(
+        SupportTicketWorkflow.run,
+        args=[
+            TicketRequest(customer_id="customer-1", message=message, order_id="order-123"),
+            approval_timeout_hours,
+        ],
+        id=ticket_id,
+        task_queue=task_queue,
     )
-    knowledge = MemoryKnowledgeRepository()
-    await knowledge.upsert(
-        [
-            KnowledgeDocument(
-                id="refund-policy",
-                title="Refund policy",
-                content="Refunds need approval within 30 days.",
-                source="refund-policy",
-            ),
-            KnowledgeDocument(
-                id="shipping-policy",
-                title="Shipping policy",
-                content="Shipping takes 3 to 5 business days.",
-                source="shipping-policy",
-            ),
-        ]
-    )
-    return build_graph(
-        settings=settings,
-        model=FakeSupportModel(),
-        knowledge=knowledge,
-        tools=ToolRegistry([lookup_order]),
-        checkpointer=InMemorySaver(),
-    )
+
+
+async def _wait_for_pause(handle: WorkflowHandle) -> None:
+    """Poll the query until the run parks at the approval interrupt."""
+
+    for _ in range(100):
+        state = await handle.query(SupportTicketWorkflow.get_state)
+        if state.status is RunStatus.WAITING_APPROVAL:
+            return
+        await asyncio.sleep(0.1)
+    pytest.fail("workflow never reached waiting_approval")
 
 
 @pytest.mark.asyncio
-async def test_read_only_order_lookup_completes_without_approval() -> None:
-    graph = await make_graph()
-    config = {"configurable": {"thread_id": "order-ticket"}}
+async def test_read_only_order_lookup_completes_without_approval(
+    support_worker: Client, task_queue: str
+) -> None:
+    handle = await _start(support_worker, task_queue, "order-ticket", "Where is my order?")
 
-    result = await graph.ainvoke(
-        {
-            "ticket_id": "order-ticket",
-            "customer_id": "customer-1",
-            "message": "Where is my order?",
-            "order_id": "order-123",
-        },
-        config,
-    )
+    state = await handle.result()
 
-    assert result["status"] == "completed"
-    assert result["tool_results"][0]["name"] == "lookup_order"
-    assert not result.get("__interrupt__")
+    assert state.status is RunStatus.COMPLETED
+    assert state.pending_action is None
+    assert state.category == "order_status"
+    assert state.citations == ["shipping-policy"]
 
 
 @pytest.mark.asyncio
-async def test_refund_pauses_then_resumes_after_approval() -> None:
-    graph = await make_graph()
-    config = {"configurable": {"thread_id": "refund-ticket"}}
+async def test_refund_pauses_then_resumes_after_approval(
+    support_worker: Client, task_queue: str
+) -> None:
+    handle = await _start(support_worker, task_queue, "refund-ticket", "Please refund my order")
+    await _wait_for_pause(handle)
 
-    paused = await graph.ainvoke(
-        {
-            "ticket_id": "refund-ticket",
-            "customer_id": "customer-1",
-            "message": "Please refund my order",
-            "order_id": "order-123",
-        },
-        config,
+    paused = await handle.query(SupportTicketWorkflow.get_state)
+    assert paused.pending_action is not None
+    assert paused.pending_action.action == "refund"
+    assert paused.pending_action.arguments["customer_id"] == "customer-1"
+
+    await handle.signal(
+        SupportTicketWorkflow.submit_decision,
+        ApprovalDecision(decision="approve", reviewer="manager-1"),
+    )
+    state = await handle.result()
+
+    assert state.status is RunStatus.COMPLETED
+    assert state.answer is not None
+    assert state.answer.startswith("Approved and submitted.")
+
+
+@pytest.mark.asyncio
+async def test_rejected_refund_ends_without_executing_the_action(
+    support_worker: Client, task_queue: str
+) -> None:
+    handle = await _start(support_worker, task_queue, "rejected-ticket", "Please refund my order")
+    await _wait_for_pause(handle)
+
+    await handle.signal(
+        SupportTicketWorkflow.submit_decision,
+        ApprovalDecision(decision="reject", reviewer="manager-1", comment="Outside policy"),
+    )
+    state = await handle.result()
+
+    assert state.status is RunStatus.REJECTED
+    assert state.answer == "The proposed refund was not approved: Outside policy"
+
+
+@pytest.mark.asyncio
+async def test_approval_deadline_auto_rejects(support_worker: Client, task_queue: str) -> None:
+    """No reviewer ever responds; the time-skipping server fast-forwards the deadline."""
+
+    handle = await _start(
+        support_worker,
+        task_queue,
+        "timeout-ticket",
+        "Please refund my order",
+        approval_timeout_hours=72,
+    )
+    await _wait_for_pause(handle)
+
+    state = await handle.result()
+
+    assert state.status is RunStatus.REJECTED
+    assert state.answer is not None
+    assert "approval timed out" in state.answer
+
+
+@pytest.mark.asyncio
+async def test_decision_is_ignored_when_not_awaiting_review(
+    support_worker: Client, task_queue: str
+) -> None:
+    """A signal that arrives for a non-paused run must not corrupt the outcome."""
+
+    handle = await _start(support_worker, task_queue, "early-signal-ticket", "Where is my order?")
+    await handle.signal(
+        SupportTicketWorkflow.submit_decision,
+        ApprovalDecision(decision="approve", reviewer="manager-1"),
     )
 
-    assert paused["__interrupt__"][0].value["action"] == "refund"
+    state = await handle.result()
 
-    completed = await graph.ainvoke(
-        Command(resume={"decision": "approve", "reviewer": "manager-1"}), config
-    )
-
-    assert completed["status"] == "completed"
-    assert completed["action_result"]["name"] == "refund"
-    assert "Approved" in completed["final_answer"]
+    assert state.status is RunStatus.COMPLETED
+    assert state.pending_action is None

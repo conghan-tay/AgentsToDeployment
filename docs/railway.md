@@ -13,25 +13,29 @@ service. Only the Go gateway receives a public domain.
 | Railway service | Source | Port | Exposure |
 |---|---|---|---|
 | `gateway` | repo, `services/gateway/Dockerfile` | 8080 | Public domain |
-| `agent` | repo, `services/agent/Dockerfile` | 8000 | Private |
+| `worker` | repo, `services/agent/Dockerfile` | none | Private, no port at all |
 | `mcp-tools` | repo, `services/mcp-tools/Dockerfile` | 8001 | Private |
-| `Postgres` | Railway managed | 5432 | Private |
 | `Redis` | Railway managed | 6379 | Private |
-| `chroma` | image `chromadb/chroma:1.5.9` + volume `/data` | 8000 | Private, optional |
+| `chroma` | image `chromadb/chroma:1.5.9` + volume `/data` | 8000 | Private |
+
+Durable execution comes from **Temporal Cloud**, not from a Railway service. Running a Temporal
+cluster on Railway is possible but is a poor use of a PaaS: it wants its own database, several
+roles, and careful upgrades. Temporal Cloud's free tier is sufficient for this template.
+
+There is no PostgreSQL service any more. The previous design used it for LangGraph checkpoints;
+Temporal now owns that state, and the application has no relational database.
 
 Services reach each other over Railway's private network at `<service>.railway.internal`.
 Environments created after 2025-10-16 resolve those names to both IPv4 and IPv6, so the existing
-`0.0.0.0` binds in all three Dockerfiles work unmodified. Older environments are IPv6-only and
-would require binding `::` instead.
+`0.0.0.0` binds in the gateway and MCP Dockerfiles work unmodified. Older environments are
+IPv6-only and would require binding `::` instead.
 
 ## Plan sizing
 
-Railway's free plan allows **five services**. The full topology needs six. Decide before you start:
-
-- **Hobby plan** — keep Chroma with a persistent volume and the full RAG path.
-- **Free plan** — omit Chroma entirely and set `KNOWLEDGE_BACKEND=memory` on the agent. Retrieval
-  degrades to the lexical `MemoryKnowledgeRepository`, and the knowledge base is held in the agent
-  process, so it must be re-seeded after every restart or deploy.
+Railway's free plan allows **five services**. This topology needs four: `gateway`, `worker`,
+`mcp-tools`, and `chroma`, plus managed Redis. Chroma is now required — knowledge ingestion writes
+to it from the gateway and retrieval reads from it in the worker, so there is no in-memory
+fallback that both processes can share.
 
 Do not create Chroma and delete it later. Deleting a service orphans its volume, which keeps
 billing until you remove it separately with `railway volume delete`.
@@ -42,6 +46,7 @@ billing until you remove it separately with `railway volume delete`.
    grant — authorize it explicitly under **New → GitHub Repo → Configure GitHub App**.
 2. Install and authenticate the CLI. Managed databases and volumes are CLI-only; they are not
    exposed over the Railway MCP server.
+3. Create a Temporal Cloud namespace and an API key.
 
 ```bash
 railway login
@@ -51,26 +56,22 @@ railway status --json
 
 ## 1. Generate production secrets
 
-Both services reject the demo credentials once `ENVIRONMENT=production`, in
-`Settings.reject_demo_production_configuration` (`services/agent/app/core/settings.py`) and
-`config.FromEnvironment` (`services/gateway/internal/config/config.go`).
+The gateway rejects the demo credential once `ENVIRONMENT=production`, in
+`config.FromEnvironment` (`services/gateway/internal/config/config.go`). The worker rejects the
+fake model in production, in `Settings.reject_demo_production_configuration`
+(`services/agent/app/core/settings.py`).
 
 ```bash
 openssl rand -hex 32 > api_key.txt            # public edge key
-openssl rand -hex 32 > internal_api_key.txt   # gateway -> agent
 ```
 
-`INTERNAL_API_KEY` must hold the same value on `gateway` and `agent` or every proxied request
-returns 401.
+Only one shared secret now. The old `INTERNAL_API_KEY` is gone: the gateway reaches the agent over
+Temporal's authenticated connection rather than over a private HTTP route, and the worker exposes
+no port to guard.
 
 ## 2. Provision stateful services first
 
-The agent's `lifespan` (`services/agent/app/main.py`) opens the PostgreSQL checkpointer during
-startup and has no fallback, so the database must exist before the agent's first boot. Only MCP
-failure is tolerated, in `ToolRegistry.create`.
-
 ```bash
-railway add --database postgres --json
 railway add --database redis --json
 ```
 
@@ -81,11 +82,10 @@ Confirm the generated connection variables, because `${{Service.VAR}}` reference
 case-sensitive:
 
 ```bash
-railway variable list --service Postgres --json    # DATABASE_URL
 railway variable list --service Redis --json       # REDIS_URL
 ```
 
-Optional Chroma service, on a plan with room for it:
+Chroma:
 
 ```bash
 railway add --service chroma --image chromadb/chroma:1.5.9 \
@@ -100,7 +100,7 @@ railway volume add --mount-path /data --json
 ```bash
 railway add --service mcp-tools --repo YOURUSER/AgentsToDeployment --branch main \
   --variables "MCP_PORT=8001" --variables "PORT=8001" --json
-railway add --service agent   --repo YOURUSER/AgentsToDeployment --branch main --json
+railway add --service worker  --repo YOURUSER/AgentsToDeployment --branch main --json
 railway add --service gateway --repo YOURUSER/AgentsToDeployment --branch main --json
 ```
 
@@ -111,44 +111,49 @@ Then set build and deploy configuration per service:
 
 | Service | `dockerfilePath` | `watchPatterns` | Healthcheck |
 |---|---|---|---|
-| `gateway` | `services/gateway/Dockerfile` | `services/gateway/**` | `/healthz` |
-| `agent` | `services/agent/Dockerfile` | `services/agent/**`, `pyproject.toml`, `uv.lock` | `/healthz`, timeout 300 |
+| `gateway` | `services/gateway/Dockerfile` | `services/gateway/**` | `/readyz` |
+| `worker` | `services/agent/Dockerfile` | `services/agent/**`, `pyproject.toml`, `uv.lock` | none |
 | `mcp-tools` | `services/mcp-tools/Dockerfile` | `services/mcp-tools/**`, `pyproject.toml`, `uv.lock` | none |
 
-Leave `rootDirectory` unset. All three Dockerfiles `COPY pyproject.toml uv.lock ./` from the
-repository root, so scoping the build root breaks them.
+The `worker` service must have **no healthcheck and no port**. Railway's healthchecks are HTTP
+probes, and the worker serves no HTTP; configuring one guarantees a failed deploy. Railway will
+report the service healthy as long as the process stays up. To check it properly, use the
+container-level command the Compose and Kubernetes setups use:
 
-The agent's healthcheck needs a generous timeout: its image installs the full dependency set and
-startup runs `AsyncPostgresSaver.setup()` plus MCP discovery before the app serves traffic.
+```bash
+railway run --service worker python -m app.healthcheck
+```
+
+Leave `rootDirectory` unset. All Dockerfiles `COPY pyproject.toml uv.lock ./` from the repository
+root, so scoping the build root breaks them.
 
 Watch patterns matter here because all three services share one repository. Without them every
 push rebuilds all three.
 
 ## 4. Set variables
 
-`agent`:
+`worker`:
 
 ```
 ENVIRONMENT=production
-PORT=8000
-INTERNAL_API_KEY=<generated>
 MODEL_PROVIDER=openai
 MODEL_NAME=gpt-5-mini
 OPENAI_API_KEY=<key>
 LANGSMITH_TRACING=true
 LANGSMITH_PROJECT=support-agent-railway
 LANGSMITH_API_KEY=<key>
-POSTGRES_DSN=${{Postgres.DATABASE_URL}}
+TEMPORAL_ADDRESS=<namespace>.<account>.tmprl.cloud:7233
+TEMPORAL_NAMESPACE=<namespace>.<account>
+TEMPORAL_API_KEY=<temporal cloud api key>
+TEMPORAL_TLS=true
+TEMPORAL_TASK_QUEUE=support-agent
+CHROMA_HOST=chroma.railway.internal
+CHROMA_PORT=8000
+CHROMA_SSL=false
+CHROMA_COLLECTION=support_knowledge
+EMBEDDING_MODEL=text-embedding-3-small
 MCP_SERVER_URL=http://mcp-tools.railway.internal:8001/mcp
-CHECKPOINTER_BACKEND=postgres
-KNOWLEDGE_BACKEND=memory
 ```
-
-With a Chroma service, set `KNOWLEDGE_BACKEND=chroma` and add `CHROMA_HOST=chroma.railway.internal`,
-`CHROMA_PORT=8000`, `CHROMA_SSL=false`, `CHROMA_COLLECTION=support_knowledge`.
-
-`OPENAI_API_KEY` is required whenever `KNOWLEDGE_BACKEND=chroma`, independent of the chat provider:
-`ChromaKnowledgeRepository.__init__` constructs `OpenAIEmbeddings` unconditionally.
 
 `gateway`:
 
@@ -157,10 +162,25 @@ ENVIRONMENT=production
 PORT=8080
 GATEWAY_PORT=8080
 API_KEY=<generated>
-INTERNAL_API_KEY=<same value as agent>
-AGENT_SERVICE_URL=http://agent.railway.internal:8000
 REDIS_URL=${{Redis.REDIS_URL}}
+TEMPORAL_ADDRESS=<namespace>.<account>.tmprl.cloud:7233
+TEMPORAL_NAMESPACE=<namespace>.<account>
+TEMPORAL_API_KEY=<temporal cloud api key>
+TEMPORAL_TLS=true
+TEMPORAL_TASK_QUEUE=support-agent
+APPROVAL_TIMEOUT_HOURS=72
+CHROMA_URL=http://chroma.railway.internal:8000
+CHROMA_COLLECTION=support_knowledge
+EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_API_KEY=<key>
 ```
+
+Three variables must be **identical** on both services or the system misbehaves quietly:
+`TEMPORAL_TASK_QUEUE` (or the gateway starts work nothing will pick up), `CHROMA_COLLECTION`, and
+`EMBEDDING_MODEL` (or the gateway writes vectors the worker cannot meaningfully search).
+
+`OPENAI_API_KEY` is required on the **gateway**, not just the worker: ingestion embeds documents at
+write time, independent of the chat provider.
 
 Use literal `.railway.internal` hostnames rather than `${{mcp-tools.RAILWAY_PRIVATE_DOMAIN}}`. The
 hyphen in the service name makes the reference syntax unreliable.
@@ -168,9 +188,7 @@ hyphen in the service name makes the reference syntax unreliable.
 Pipe secrets through stdin so they never reach shell history:
 
 ```bash
-tr -d '\n' < internal_api_key.txt | railway variable set INTERNAL_API_KEY --stdin --service agent
-tr -d '\n' < internal_api_key.txt | railway variable set INTERNAL_API_KEY --stdin --service gateway
-tr -d '\n' < api_key.txt          | railway variable set API_KEY --stdin --service gateway
+tr -d '\n' < api_key.txt | railway variable set API_KEY --stdin --service gateway
 ```
 
 ## 5. Expose only the gateway
@@ -179,23 +197,23 @@ tr -d '\n' < api_key.txt          | railway variable set API_KEY --stdin --servi
 railway domain --service gateway --port 8080 --json
 ```
 
-Never generate a domain for `agent`, `mcp-tools`, or `chroma`. The internal FastAPI routes are
-guarded only by `X-Internal-API-Key`, and Chroma has no authentication at all.
+Never generate a domain for `worker`, `mcp-tools`, or `chroma`. Chroma has no authentication at
+all, and the worker has no HTTP surface worth exposing.
 
 ## 6. Deploy and seed
 
-Redeploy in dependency order so the agent finds MCP on its first boot:
+Redeploy in dependency order so the worker finds MCP on its first boot:
 
 ```bash
 railway redeploy --service mcp-tools --from-source --yes
-railway redeploy --service agent     --from-source --yes
+railway redeploy --service worker    --from-source --yes
 railway redeploy --service gateway   --from-source --yes
 ```
 
 A queued build is not a deploy. Poll each service until it reaches a terminal state:
 
 ```bash
-railway deployment list --service agent --environment production --limit 1 --json
+railway deployment list --service worker --environment production --limit 1 --json
 ```
 
 Then seed the knowledge base through the public gateway. `scripts/seed_knowledge.py` prefers real
@@ -205,29 +223,44 @@ environment variables over the project `.env`, so no file needs editing:
 API_BASE_URL=https://<your-domain> API_KEY=<generated> uv run python scripts/seed_knowledge.py
 ```
 
+Seeding now exercises the gateway's own embed-and-upsert path; it never touches the worker.
+
 ## Verification
 
 ```bash
-curl -sS https://<your-domain>/healthz                       # 200
+curl -sS https://<your-domain>/healthz                       # 200, liveness only
+curl -sS https://<your-domain>/readyz                        # 200 once Temporal is reachable
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -X POST https://<your-domain>/v1/tickets \
   -H 'Content-Type: application/json' -d '{}'                # 401, auth enforced
 ```
 
 Exercise the read-only path, then the durable approval path, using the `curl` examples in the
-[README](../README.md). A refund should return `waiting_approval` with a `pending_action`, and the
-decision endpoint should resume the same thread to `completed` — that resume is what proves the
-PostgreSQL checkpointer is working.
+[README](../README.md). Remember that runs are asynchronous: `POST /v1/tickets` returns `202` with
+`status: "running"`, and you poll `GET /v1/tickets/{id}` until it reports `waiting_approval`, then
+`completed`.
+
+The proof that durable execution works is a worker restart mid-approval:
+
+```bash
+# with a ticket parked at waiting_approval
+railway redeploy --service worker --yes
+# then approve it; the run resumes on the new container
+```
+
+Watch the same run in the Temporal Cloud UI. A completed refund's history shows one activity per
+graph node, the `submit_decision` signal, and `support.apply_action` scheduled only *after* that
+signal — which is the visible proof that the side effect cannot precede approval.
 
 Confirm MCP loaded rather than falling back to the local demo tool:
 
 ```bash
-railway logs --service agent --lines 300 | grep -E 'mcp_tools_loaded|mcp_unavailable'
+railway logs --service worker --lines 300 | grep -E 'mcp_tools_loaded|mcp_unavailable'
 ```
 
 build logs
 ```bash
-railway logs --service agent --environment production --build --lines 200   # build instead of runtime
+railway logs --service worker --environment production --build --lines 200
 ```
 
 The distinction is visible in responses too. The MCP server's `lookup_order` derives status from
@@ -237,7 +270,7 @@ fallback in `tools/registry.py` always returns `in_transit` with 3 days.
 Finally, confirm nothing private is exposed:
 
 ```bash
-railway domain list --service agent --json      # expect no domains
+railway domain list --service worker --json     # expect no domains
 railway domain list --service mcp-tools --json  # expect no domains
 ```
 
@@ -262,13 +295,14 @@ railway domain list --service mcp-tools --json  # expect no domains
 
 ## Notes and caveats
 
-- Keep replicas at 1. Refund idempotency lives in the in-process `_completed_actions` dictionary in
-  `ToolRegistry`, so a second replica can execute the same approved action twice. Moving that key
-  into the destination business system is the prerequisite for scaling out.
-- With `KNOWLEDGE_BACKEND=memory`, re-seed after every agent restart or deploy.
-- If PostgreSQL rejects the connection with an SSL error, use
-  `POSTGRES_DSN=${{Postgres.DATABASE_URL}}?sslmode=disable`. psycopg's default `prefer` mode
-  normally negotiates without help.
+- Keep `worker` replicas at 1. Refund idempotency lives in the in-process `_completed_actions`
+  dictionary in `ToolRegistry`, so a second replica can execute the same approved action twice.
+  Moving that key into the destination business system is the prerequisite for scaling out.
+- `GET /v1/tickets/{id}` is a Temporal query and is answered by a worker. If every worker is down
+  the gateway returns `502` even though the run itself is safe — a redeploy of `worker` briefly
+  makes reads unavailable while writes stay durable.
+- Set a retention period on the Temporal namespace. Closed histories are the audit trail for who
+  approved which refund.
 - `.env` is gitignored and is not copied by any Dockerfile, so local secrets never enter the images.
-- Rotate `API_KEY` and `INTERNAL_API_KEY` on a schedule, and replace the shared edge key with
+- Rotate `API_KEY` and the Temporal API key on a schedule, and replace the shared edge key with
   JWT/OAuth validation at the gateway before serving real customers.
