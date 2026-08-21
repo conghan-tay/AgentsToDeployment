@@ -12,8 +12,8 @@ lint:
 test: test-unit
 
 test-unit:
-	uv run pytest -m "not e2e" --cov --cov-report=term-missing
-	cd services/gateway && go test ./...
+	uv run pytest -m "not e2e" --cov --cov-report=term-missing -v
+	cd services/gateway && go test -v ./...
 
 # Runs the real public API against the container stack. The chat model is faked, but
 # retrieval uses real embeddings, so OPENAI_API_KEY must be set in .env.

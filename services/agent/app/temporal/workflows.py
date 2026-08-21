@@ -110,13 +110,18 @@ class SupportTicketWorkflow:
 
         if result.interrupts:
             pending = PendingAction.model_validate(result.interrupts[0].value)
-            self._state = self._project(ticket_id, created_at, result.value, pending)
+            self._state = to_run_state(
+                ticket_id=ticket_id,
+                values=result.value,
+                created_at=created_at,
+                pending_action=pending,
+            )
             decision = await self._await_decision()
             result = await app.ainvoke(
                 Command(resume=decision.model_dump(mode="json")), config, version="v2"
             )
 
-        self._state = self._project(ticket_id, created_at, result.value, None)
+        self._state = to_run_state(ticket_id=ticket_id, values=result.value, created_at=created_at)
         return self._state
 
     async def _await_decision(self) -> ApprovalDecision:
@@ -136,17 +141,3 @@ class SupportTicketWorkflow:
             return _TIMED_OUT_DECISION
         assert self._decision is not None
         return self._decision
-
-    @staticmethod
-    def _project(
-        ticket_id: str,
-        created_at: Any,
-        values: Any,
-        pending: PendingAction | None,
-    ) -> RunState:
-        return to_run_state(
-            ticket_id=ticket_id,
-            values=dict(values or {}),
-            created_at=created_at,
-            pending_action=pending,
-        )

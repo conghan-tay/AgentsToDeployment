@@ -22,16 +22,21 @@ def citations(answer: str | None) -> list[str]:
 def to_run_state(
     *,
     ticket_id: str,
-    values: dict[str, Any],
+    values: dict[str, Any] | None,
     created_at: datetime | None = None,
     pending_action: PendingAction | None = None,
 ) -> RunState:
     """Project final graph state onto the public run state.
 
+    `values` accepts None so callers can pass a graph result straight through: an
+    interrupted run can carry no state yet, and that is a mapping concern rather than
+    something every caller should normalize.
+
     `pending_action` is supplied by the caller rather than read from state because the
     pause is expressed as a LangGraph interrupt, which never lands in the state dict.
     """
 
+    values = values or {}
     answer = values.get("final_answer")
     classification = values.get("classification")
     status = (

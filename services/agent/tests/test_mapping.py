@@ -43,6 +43,18 @@ def test_pending_action_forces_waiting_approval() -> None:
     assert state.citations == ["refund-policy"]
 
 
+def test_absent_state_is_treated_as_empty() -> None:
+    """A graph result can carry no state, so the mapping normalizes it rather than
+    making every caller guard."""
+
+    state = to_run_state(ticket_id="ticket-4", values=None)
+
+    assert state.status is RunStatus.COMPLETED
+    assert state.answer is None
+    assert state.category is None
+    assert state.citations == []
+
+
 def test_rejected_status_is_preserved() -> None:
     state = to_run_state(
         ticket_id="ticket-3",
