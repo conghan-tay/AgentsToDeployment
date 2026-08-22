@@ -1,11 +1,16 @@
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# These models are the Temporal payload contract. The Go gateway mirrors them field
+# for field in services/gateway/internal/api/types.go; renaming a field here without
+# renaming it there breaks the workflow at runtime, not at build time.
+
 
 class RunStatus(StrEnum):
+    RUNNING = "running"
     COMPLETED = "completed"
     WAITING_APPROVAL = "waiting_approval"
     REJECTED = "rejected"
@@ -31,14 +36,18 @@ class PendingAction(BaseModel):
     reason: str
 
 
-class RunResponse(BaseModel):
+class RunState(BaseModel):
+    """The workflow's public state, returned by the `get_state` query and the run result."""
+
     ticket_id: str
     status: RunStatus
     answer: str | None = None
     category: str | None = None
     pending_action: PendingAction | None = None
     citations: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Set from workflow.now(), never datetime.now(): workflow code must be deterministic
+    # so that replay produces the same value.
+    created_at: datetime | None = None
 
 
 class KnowledgeDocument(BaseModel):
@@ -47,16 +56,3 @@ class KnowledgeDocument(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     source: str = Field(min_length=1, max_length=500)
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class KnowledgeUpsertRequest(BaseModel):
-    documents: list[KnowledgeDocument] = Field(min_length=1, max_length=100)
-
-
-class KnowledgeUpsertResponse(BaseModel):
-    upserted: int
-
-
-class HealthResponse(BaseModel):
-    status: Literal["ok", "degraded"]
-    service: str = "agent"

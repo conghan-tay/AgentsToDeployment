@@ -43,5 +43,5 @@ jobs:
     needs: [python, go]
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose build gateway agent mcp-tools
+      - run: docker compose build gateway worker mcp-tools
 
