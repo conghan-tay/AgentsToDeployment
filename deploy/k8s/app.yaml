@@ -54,7 +54,7 @@ metadata:
   name: worker
   namespace: support-agent
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels: {app: worker}
   template:

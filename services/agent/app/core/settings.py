@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     temporal_tls: bool = False
 
     chroma_host: str = "localhost"
-    chroma_port: int = 8001
+    chroma_port: int = 8000
     chroma_ssl: bool = False
     chroma_collection: str = "support_knowledge"
     # Must match EMBEDDING_MODEL on the gateway: the gateway writes the vectors this

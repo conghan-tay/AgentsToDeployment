@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -255,20 +256,20 @@ func (h *Handler) authenticate(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		provided := r.Header.Get("X-API-Key")
-		if provided == "" {
-			provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		}
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(h.apiKey)) != 1 {
-			writeError(w, http.StatusUnauthorized, "invalid API key")
-			return
-		}
 		allowed, err := h.limiter.Allow(r.Context(), rateLimitKey(r))
 		if err != nil {
 			// Rate limiting fails open so a Redis outage does not take down support.
 			h.logger.Warn("rate limiter unavailable", "error", err)
 		} else if !allowed {
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		provided := r.Header.Get("X-API-Key")
+		if provided == "" {
+			provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(h.apiKey)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -281,7 +282,10 @@ func rateLimitKey(r *http.Request) string {
 			return addr.String()
 		}
 	}
-	if host, _, ok := strings.Cut(r.RemoteAddr, ":"); ok {
+	// net.SplitHostPort rather than a cut at the first colon: RemoteAddr for an IPv6
+	// client is "[2001:db8::1]:54321", and cutting there yields "[", collapsing every
+	// IPv6 caller in the world into a single shared bucket.
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
 	return r.RemoteAddr

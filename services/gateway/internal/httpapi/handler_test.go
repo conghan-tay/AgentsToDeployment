@@ -66,6 +66,33 @@ func (f *fakeKnowledge) Upsert(
 	return len(documents), nil
 }
 
+// recordingLimiter captures the keys it was asked about so tests can assert both that
+// the limiter ran and what it was keyed on.
+type recordingLimiter struct {
+	keys      []string
+	allow     bool
+	returnErr error
+}
+
+func (l *recordingLimiter) Allow(_ context.Context, key string) (bool, error) {
+	l.keys = append(l.keys, key)
+	if l.returnErr != nil {
+		return false, l.returnErr
+	}
+	return l.allow, nil
+}
+
+func newLimitedHandler(limiter RateLimiter) http.Handler {
+	return New(Options{
+		APIKey:    "secret",
+		Tickets:   &fakeTickets{},
+		Knowledge: &fakeKnowledge{},
+		Limiter:   limiter,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Timeout:   time.Second,
+	})
+}
+
 func newHandler(service *fakeTickets, repository *fakeKnowledge) http.Handler {
 	if service == nil {
 		service = &fakeTickets{}
@@ -118,6 +145,108 @@ func TestHealthzDoesNotRequireAuthentication(t *testing.T) {
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestRequestsThatFailAuthenticationStillConsumeRateLimitBudget(t *testing.T) {
+	limiter := &recordingLimiter{allow: true}
+	handler := newLimitedHandler(limiter)
+	request := httptest.NewRequest(http.MethodGet, "/v1/tickets/ticket-1", nil)
+	request.Header.Set("X-API-Key", "wrong-key")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	// Without this, guessing the API key is free: the counter is never incremented, so
+	// there is neither a limit to hit nor a number anyone could alert on.
+	if len(limiter.keys) != 1 {
+		t.Fatalf("limiter consulted %d times, want 1", len(limiter.keys))
+	}
+}
+
+func TestExhaustedRateLimitIsRejectedBeforeTheKeyCheck(t *testing.T) {
+	handler := newLimitedHandler(&recordingLimiter{allow: false})
+	request := httptest.NewRequest(http.MethodGet, "/v1/tickets/ticket-1", nil)
+	request.Header.Set("X-API-Key", "wrong-key")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestHealthRoutesAreNotRateLimited(t *testing.T) {
+	limiter := &recordingLimiter{allow: false}
+	handler := newLimitedHandler(limiter)
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, recorder.Code, http.StatusOK)
+		}
+	}
+	if len(limiter.keys) != 0 {
+		t.Fatalf("health routes consulted the limiter: %v", limiter.keys)
+	}
+}
+
+func TestRateLimiterOutageFailsOpen(t *testing.T) {
+	handler := newLimitedHandler(&recordingLimiter{returnErr: errors.New("redis is down")})
+
+	recorder := do(handler, http.MethodGet, "/v1/tickets/ticket-1", "")
+
+	// A Redis outage must not take down support, so the request is served anyway.
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRateLimitKeyIdentifiesEachClientAddress(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		forwarded  string
+		want       string
+	}{
+		{name: "ipv4", remoteAddr: "192.0.2.5:54321", want: "192.0.2.5"},
+		// Cutting at the first colon returned "[" for every one of these, so all IPv6
+		// clients shared a single bucket.
+		{name: "ipv6", remoteAddr: "[2001:db8::1]:54321", want: "2001:db8::1"},
+		{name: "ipv6 loopback", remoteAddr: "[::1]:8080", want: "::1"},
+		{name: "ipv6 with zone", remoteAddr: "[fe80::1%eth0]:9000", want: "fe80::1%eth0"},
+		{name: "address without a port", remoteAddr: "192.0.2.9", want: "192.0.2.9"},
+		{
+			name:       "forwarded address wins",
+			remoteAddr: "192.0.2.5:54321",
+			forwarded:  "2001:db8::99, 198.51.100.7",
+			want:       "2001:db8::99",
+		},
+		{
+			name:       "unparseable forwarded address falls back to the peer",
+			remoteAddr: "[2001:db8::2]:1234",
+			forwarded:  "not-an-ip",
+			want:       "2001:db8::2",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/v1/tickets/ticket-1", nil)
+			request.RemoteAddr = testCase.remoteAddr
+			if testCase.forwarded != "" {
+				request.Header.Set("X-Forwarded-For", testCase.forwarded)
+			}
+
+			if key := rateLimitKey(request); key != testCase.want {
+				t.Fatalf("key = %q, want %q", key, testCase.want)
+			}
+		})
 	}
 }
 

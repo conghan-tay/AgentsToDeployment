@@ -67,7 +67,7 @@ func FromEnvironment() (Config, error) {
 
 		ApprovalTimeoutHours: approvalTimeout,
 
-		ChromaURL:        envOr("CHROMA_URL", "http://localhost:8001"),
+		ChromaURL:        envOr("CHROMA_URL", "http://localhost:8000"),
 		ChromaTenant:     envOr("CHROMA_TENANT", "default_tenant"),
 		ChromaDatabase:   envOr("CHROMA_DATABASE", "default_database"),
 		ChromaCollection: envOr("CHROMA_COLLECTION", "support_knowledge"),
